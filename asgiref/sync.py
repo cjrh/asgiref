@@ -117,8 +117,10 @@ class ThreadSensitiveContext:
     The ThreadSensitiveContext() context manager may be used to specify a
     thread pool per context.
 
-    This context manager is re-entrant, so only the outer-most call to
-    ThreadSensitiveContext will set the context.
+    By default, only the outer-most ThreadSensitiveContext sets the context.
+    With force_new_thread=True, this block uses a new thread even inside another
+    context or an AsyncToSync call. On exit, the parent context is restored.
+    Use a separate instance for each active force_new_thread=True block.
 
     Usage:
 
@@ -127,14 +129,26 @@ class ThreadSensitiveContext:
     ...     await sync_to_async(time.sleep, 1)()
     """
 
-    def __init__(self):
-        self.token = None
+    def __init__(self, *, force_new_thread: bool = False) -> None:
+        self.force_new_thread = force_new_thread
+        self.token: "contextvars.Token[ThreadSensitiveContext] | None" = None
+        self._old_executor: CurrentThreadExecutor | None = None
 
     async def __aenter__(self):
-        try:
-            SyncToAsync.thread_sensitive_context.get()
-        except LookupError:
+        if self.force_new_thread:
+            if self.token is not None:
+                raise RuntimeError("ThreadSensitiveContext is already entered")
             self.token = SyncToAsync.thread_sensitive_context.set(self)
+            # A parent AsyncToSync executor would otherwise take priority over
+            # this context. Hide it in this task, but let AsyncToSync calls
+            # inside the new worker install their own executors as usual.
+            self._old_executor = getattr(AsyncToSync.executors, "current", None)
+            AsyncToSync.executors.current = None
+        else:
+            try:
+                SyncToAsync.thread_sensitive_context.get()
+            except LookupError:
+                self.token = SyncToAsync.thread_sensitive_context.set(self)
 
         return self
 
@@ -144,6 +158,10 @@ class ThreadSensitiveContext:
 
         executor = SyncToAsync.context_to_thread_executor.pop(self, None)
         SyncToAsync.thread_sensitive_context.reset(self.token)
+        self.token = None
+        if self.force_new_thread:
+            AsyncToSync.executors.current = self._old_executor
+            self._old_executor = None
         if executor:
             # The executor's worker thread may itself be waiting for this
             # event loop, so a blocking shutdown() here would deadlock it.

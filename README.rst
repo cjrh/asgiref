@@ -50,6 +50,47 @@ thread for safety reasons; you can disable this for more performance with
 not rely on anything bound to threads (like database connections) when you do.
 
 
+Thread-sensitive contexts
+-------------------------
+
+``ThreadSensitiveContext`` gives thread-sensitive ``sync_to_async`` calls a
+shared, single-worker executor for an async block. Nested contexts reuse the
+outer context by default. Use ``force_new_thread=True`` to create a separate
+worker, including when the block is reached through ``async_to_sync``. The new
+worker starts on the first thread-sensitive call::
+
+    from asgiref.sync import ThreadSensitiveContext, sync_to_async
+
+    async with ThreadSensitiveContext():
+        await sync_to_async(parent_work)()
+        async with ThreadSensitiveContext(force_new_thread=True):
+            await sync_to_async(child_work)()
+            await sync_to_async(more_child_work)()
+        await sync_to_async(parent_work)()
+
+Both child calls use the same new thread. After the child block exits, calls
+use the parent thread again. Nested ``sync_to_async`` / ``async_to_sync`` calls
+within the child block also retain its thread affinity.
+
+Tasks created inside a block inherit its context. To isolate concurrent tasks,
+each task must enter its own ``ThreadSensitiveContext(force_new_thread=True)``.
+Wait for those tasks before leaving the context. Use a separate context manager
+instance for each active forced block. ``thread_sensitive=False`` calls are not
+affected.
+
+This separates thread-critical ``Local`` storage, such as Django's connection
+storage. It does not change normal ``ContextVar`` or non-thread-critical
+``Local`` propagation. Look up thread-bound resources inside the worker; do not
+pass a connection or cursor from the parent thread. Close child resources on
+the child thread before leaving the block. Executor shutdown does not call
+resource-specific cleanup methods.
+
+This is thread isolation, not a transaction API. A transaction that spans
+several sync calls must enter, run, and exit on the same worker. Normal nested
+Django ``atomic()`` blocks should still share their connection and savepoints;
+only an independent transaction scope needs a separate context.
+
+
 Threadlocal replacement
 -----------------------
 
