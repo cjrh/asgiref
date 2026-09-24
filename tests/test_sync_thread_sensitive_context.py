@@ -19,6 +19,10 @@ from asgiref.sync import (
 
 @pytest.mark.asyncio
 async def test_force_new_context_restores_parent() -> None:
+    """Nested forced contexts use separate threads and restore the parent on exit.
+
+    Child workers stop on exit; the parent worker remains available.
+    """
     thread = sync_to_async(threading.current_thread)
 
     async with ThreadSensitiveContext() as parent:
@@ -47,6 +51,10 @@ async def test_force_new_context_restores_parent() -> None:
 
 @pytest.mark.asyncio
 async def test_force_new_context_without_parent() -> None:
+    """A forced context works without an outer context.
+
+    Its thread stops on exit, and later calls use the default worker again.
+    """
     thread = sync_to_async(threading.current_thread)
     parent_thread = await thread()
     async with ThreadSensitiveContext(force_new_thread=True) as child:
@@ -60,6 +68,10 @@ async def test_force_new_context_without_parent() -> None:
 
 @pytest.mark.asyncio
 async def test_force_new_context_siblings_are_isolated() -> None:
+    """Concurrent forced contexts use different threads.
+
+    Each context keeps its thread, including for tasks created inside it.
+    """
     thread = sync_to_async(threading.current_thread)
     both_inside = asyncio.Barrier(2)
 
@@ -118,6 +130,11 @@ def force_new_context_across_bridges(async_outermost: bool) -> None:
 
 @pytest.mark.parametrize("async_outermost", [False, True])
 def test_force_new_context_across_bridges(async_outermost: bool) -> None:
+    """Nested sync and async calls stay on the current context's worker.
+
+    Forced contexts use a new worker and restore the parent without deadlocking,
+    whether the outermost caller is sync or async.
+    """
     # A deadlocked worker can also block interpreter shutdown. Run the bridge
     # checks in a separate process so the parent can stop it after a timeout.
     # Spawn avoids inheriting executor state from the parent's worker threads.
@@ -142,6 +159,10 @@ def test_force_new_context_across_bridges(async_outermost: bool) -> None:
 
 @pytest.mark.asyncio
 async def test_force_new_context_isolates_thread_critical_storage() -> None:
+    """Forced contexts separate thread-bound data, such as database connections.
+
+    Other context data still passes between the async caller and sync worker.
+    """
     # Django's ConnectionHandler uses this storage for database wrappers.
     connections = Local(thread_critical=True)
     shared = Local()
@@ -176,6 +197,8 @@ async def test_force_new_context_isolates_thread_critical_storage() -> None:
 
 @pytest.mark.parametrize("error", [ValueError, asyncio.CancelledError])
 def test_force_new_context_restores_parent_on_error(error: type[BaseException]) -> None:
+    """An exception or cancellation restores the parent and stops the child worker."""
+
     async def run() -> None:
         parent_executor = AsyncToSync.executors.current
         async with ThreadSensitiveContext() as parent:
@@ -195,6 +218,7 @@ def test_force_new_context_restores_parent_on_error(error: type[BaseException]) 
 
 @pytest.mark.asyncio
 async def test_force_new_context_cancellation_waits_without_blocking() -> None:
+    """Cancellation waits for the child worker while the event loop stays responsive."""
     loop = asyncio.get_running_loop()
     started = asyncio.Event()
     release = threading.Event()
@@ -237,6 +261,7 @@ async def test_force_new_context_cancellation_waits_without_blocking() -> None:
 
 @pytest.mark.asyncio
 async def test_force_new_context_leaves_non_thread_sensitive_calls_unchanged() -> None:
+    """Calls with thread_sensitive=False keep using their chosen executor."""
     with ThreadPoolExecutor(max_workers=1) as executor:
         thread = sync_to_async(
             threading.current_thread, thread_sensitive=False, executor=executor
@@ -249,6 +274,7 @@ async def test_force_new_context_leaves_non_thread_sensitive_calls_unchanged() -
 
 @pytest.mark.asyncio
 async def test_force_new_context_reuse() -> None:
+    """A forced context can be reused after exit, but not while it is active."""
     context = ThreadSensitiveContext(force_new_thread=True)
     async with context:
         first = await sync_to_async(threading.current_thread)()
@@ -262,6 +288,7 @@ async def test_force_new_context_reuse() -> None:
 
 @pytest.mark.asyncio
 async def test_force_new_context_without_sync_work() -> None:
+    """An unused forced context exits cleanly and restores the parent context."""
     async with ThreadSensitiveContext() as parent:
         async with ThreadSensitiveContext(force_new_thread=True) as child:
             assert SyncToAsync.thread_sensitive_context.get() is child
