@@ -136,6 +136,221 @@ class ThreadSensitiveContext:
 
     async def __aenter__(self):
         if self.force_new_thread:
+
+            """
+            (temporary, remove before merge)
+
+            =============
+            EXPLANATION 1
+            =============
+
+            Ok, story time. Why oh why are we juggling executors here inside `ThreadSensitiveContext`?
+
+            Let's establish some observations:
+
+            - We want to allow `async with transaction.atomic():`
+            - We'll implement the async support with something like this (on `Atomic`). Let's start
+              WITHOUT transaction-specific isolation, so we can see what's missing.
+              These sketches show one entry/exit pair, not a complete implementation. Django's task
+              tracking and full entry-failure/cancellation cleanup are omitted. Reusing an `Atomic`
+              instance also needs per-entry state, rather than the simple instance attributes below.
+
+            ```
+            async def __aenter__(self):
+                self._tsc = ThreadSensitiveContext()
+                await self._tsc.__aenter__()
+                await sync_to_async(self.__enter__)()       # existing sync logic, on the selected thread
+
+            async def __aexit__(self, *exc):
+                try:
+                    await sync_to_async(self.__exit__)(*exc)
+                finally:
+                    await self._tsc.__aexit__(*exc)
+            ```
+
+            - Note we are first entering ThreadSensitiveContext, and thereafter calling `sync_to_async`.
+              Entering the context does not itself create a thread.
+            - Which thread does `sync_to_async` use? It depends:
+                - If `thread_sensitive==False` => the supplied executor, or the event loop's default executor
+                - Otherwise, if a parent `async_to_sync` executor is visible => the waiting parent sync thread
+                - Otherwise, the executor of the current `ThreadSensitiveContext`, if one is active
+                - Otherwise, a waiting sync thread registered for this event loop by `async_to_sync`, if any
+                - Otherwise, asgiref's shared single-worker executor, unless its deadlock check rejects the call
+
+            - Special note about the executor of the current `ThreadSensitiveContext`: If there is no
+              executor created yet, `sync_to_async` creates one. Submitting the first call starts its worker.
+              Later calls in the same context reuse that worker. In Django ASGI, request handlers are already
+              wrapped in `ThreadSensitiveContext`! A plain nested context reuses that request context.
+              The context marker is already set, even if its worker has not started yet.
+
+            - The problem with our first example is that the thread being used in the `sync_to_async` call
+              IS NOT reserved for this transaction. Other tasks in the request can use it too.
+              A thread living longer than a transaction is not itself a problem. Sharing its connection
+              with other tasks WHILE THE TRANSACTION IS OPEN is the problem.
+
+            - "So what?", you might say. Well, the issue lies with how Django hands out connections.
+              On a sync worker, Django keeps one connection wrapper per database alias, per thread.
+              This is thread-local storage, not necessarily a connection pool.
+              Now, if we have THE SAME THREAD being used inside and outside of the `transaction.atomic`
+              scope, those calls can use the same db connection.
+
+            - This means that multiple async tasks can submit db operations to that same thread and
+              connection. The sync calls run one at a time, BUT a transaction spans several calls:
+              begin, database work, and commit/rollback. An `await` between these calls lets another
+              task submit work on the same connection while the first task's transaction is still open.
+
+            - A ROLLBACK would then undo writes made by those other tasks during that transaction,
+              even though they are not part of the same `transaction.atomic` scope. This is a very bad thing.
+
+            - Yes, this is complex. It's not just you. Here is an example of the problem from the
+              user perspective:
+
+                  ======================================================================
+                     Imagine two tasks started by the same async view. Both use the same
+                     database alias.                              
+                                                                                                                                           
+                     Assume a basic implementation of async atomic() that does not create
+                     a separate thread-sensitive context.             
+                                                                                                                                           
+                     The events below make the order predictable:                                                                          
+                                                                                                                                           
+                     ```python                                                                                                             
+                       transaction_started = asyncio.Event()                                                                               
+                       other_write_finished = asyncio.Event()                                                                              
+                                                                                                                                           
+                       async def task_one():                                                                                               
+                           try:                                                                                                            
+                               async with transaction.atomic():                                                                            
+                                   await Message.objects.acreate(text="From task one")                                                     
+                                   transaction_started.set()                                                                               
+                                                                                                                                           
+                                   # Pause here while the other task writes.                                                               
+                                   await other_write_finished.wait()                                                                       
+                                                                                                                                           
+                                   raise ValueError("Undo my work")                                                                        
+                           except ValueError:                                                                                              
+                               pass                                                                                                        
+                                                                                                                                           
+                       async def task_two():                                                                                               
+                           await transaction_started.wait()                                                                                
+                                                                                                                                           
+                           # This is OUTSIDE the atomic block.                                                                             
+                           await Message.objects.acreate(text="From task two")                                                             
+                                                                                                                                           
+                           other_write_finished.set()                                                                                      
+                                                                                                                                           
+                       await asyncio.gather(task_one(), task_two())                                                                        
+                     ```                                                                                                                   
+                                                                                                                                           
+                     ### What the application author expects                                                                               
+                                                                                                                                           
+                     - Task one’s message is rolled back.                                                                                  
+                     - Task two’s message remains—it was written outside the atomic() block.                                               
+                                                                                                                                           
+                     ### What the shared database connection actually sees                                                                 
+                                                                                                                                           
+                     ```text                                                                                                               
+                       Task one:  BEGIN                                                                                                    
+                       Task one:  INSERT "From task one"                                                                                   
+                                  ── task one pauses; the worker is available ──                                                           
+                       Task two:  INSERT "From task two"                                                                                   
+                                  ── task one resumes and raises ValueError ──                                                             
+                       Task one:  ROLLBACK                            
+                  ======================================================================
+
+            - What we need is a way to give each INDEPENDENT async transaction its own connection.
+              Nested `atomic()` blocks in the owning task must keep that connection and use savepoints.
+              Subtasks created inside the transaction still inherit its context, so Django must separately
+              enforce transaction ownership and require those subtasks to finish before the transaction exits.
+            - BECAUSE Django finds connections by worker thread, we can use its existing connection storage
+              by giving each independent transaction its own thread. NOT a new thread for each savepoint.
+
+            - This is what `force_new_thread=True` does. Let's update the example above:
+
+            ```
+            async def __aenter__(self):
+                self._outermost = not in_async_atomic_block()   # Django-side task/transaction tracking
+
+                self._tsc = ThreadSensitiveContext(force_new_thread=self._outermost)  # <====== NEW NEW NEW
+
+                await self._tsc.__aenter__()
+                await sync_to_async(self.__enter__)()       # new thread for the independent transaction
+
+            async def __aexit__(self, *exc):
+                try:
+                    try:
+                        await sync_to_async(self.__exit__)(*exc)
+                    finally:
+                        if self._outermost:
+                            await sync_to_async(lambda: get_connection(self.using).close())()
+                finally:
+                    await self._tsc.__aexit__(*exc)
+            ```
+
+            - If `force_new_thread==True`, then a NEW context marker is set. The first `sync_to_async`
+              call that selects this context MUST create its executor; later calls reuse it.
+              The transaction's entry, database work, exit, and connection cleanup all use that worker.
+              Notice that the connection lookup for `close()` is INSIDE the sync function, not on the event loop.
+
+            - The Django machinery will check for a connection wrapper on that worker, find nothing,
+              and create one. The underlying database connection is obtained when transaction entry needs it.
+              That worker and connection are then used for the transaction, including its nested savepoints.
+
+            - Now we get into some tricky details: when we call `async with transaction.atomic():`, we will
+              usually already have a parent `ThreadSensitiveContext`. Its executor stays in the context-to-executor
+              dictionary; `self.token` lets us restore that parent context on exit. We do not need to save its pool.
+              BUT if we reached this async code through `async_to_sync`, there may ALSO be a `CurrentThreadExecutor`
+              pointing back to a waiting sync thread. This is a DIFFERENT executor, and `sync_to_async` checks it
+              BEFORE the thread-sensitive context. Just setting our new context would still send work to that
+              parent thread! We need to hide this executor, but we don't want to LOSE its reference.
+
+            - So this is why we save that `CurrentThreadExecutor` in `self._old_executor`, clear the visible
+              reference, and restore it on exit. This change applies to the current context, not all tasks.
+              We must not simply reverse the executor selection order: our new worker might itself call
+              `async_to_sync` and wait for async code that calls back into sync code. Those callbacks need
+              its NEW `CurrentThreadExecutor`; putting them on its ordinary pool would queue them behind
+              the very call that is waiting for them. Clearing only the inherited executor at entry lets
+              these later bridges work normally, without sending our transaction back to the parent thread.
+
+            =============
+            EXPLANATION 2
+            =============
+
+            (AI)
+
+            An async transaction spans several synchronous calls: transaction entry, database operations, and transaction exit. 
+            These calls must use the same connection. However, other tasks must not accidentally run their operations on that   
+            connection while its transaction is open.                                                                           
+                                                                                                                                
+            Django already stores connections by worker thread, so an independent transaction can get its own connection by     
+            using its own thread-sensitive context.                                                                             
+                                                                                                                                
+            Entering that context does not immediately create a thread. It sets the context that subsequent sync_to_async calls 
+            will use. The first call creates its single-worker executor; later calls reuse it.                                  
+                                                                                                                                
+            But setting a new context is not sufficient.                                                                        
+                                                                                                                                
+            If we reached this async code through async_to_sync, there may already be a CurrentThreadExecutor pointing back to  
+            the waiting sync thread. SyncToAsync checks for that executor before checking the thread-sensitive context. Without 
+            another change, our supposedly independent transaction would still run on the parent thread.                        
+                                                                                                                                
+            We therefore save that inherited executor in _old_executor and temporarily clear AsyncToSync.executors.current.     
+            This lets the existing selection logic reach our new context and use its worker.                                    
+                                                                                                                                
+            Why not change the selection order instead?                                                                         
+                                                                                                                                
+            Code running on the new worker may itself call async_to_sync. That worker then waits for async code, which may call 
+            back into sync code. Those callbacks must use the new worker’s CurrentThreadExecutor. Queuing them on its ordinary  
+            thread pool would deadlock: the worker would be waiting for work queued behind itself.                              
+                                                                                                                                
+            Clearing the inherited executor at context entry handles both cases. It prevents a return to the parent thread,     
+            while allowing bridges created inside the new scope to install their own executors normally.                        
+                                                                                                                                
+            On exit, self.token restores the parent thread-sensitive context, and _old_executor restores the saved bridge       
+            executor. These restore two different pieces of state.  
+
+            """
+
             if self.token is not None:
                 raise RuntimeError("ThreadSensitiveContext is already entered")
             self.token = SyncToAsync.thread_sensitive_context.set(self)
