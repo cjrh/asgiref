@@ -265,7 +265,8 @@ class ThreadSensitiveContext:
             - BECAUSE Django finds connections by worker thread, we can use its existing connection storage
               by giving each independent transaction its own thread. NOT a new thread for each savepoint.
 
-            - This is what `force_new_thread=True` does. Let's update the example above:
+            - This is what `force_new_thread=True` does. Let's update the impl
+              of `async with transaction.atomic():` example above:
 
             ```
             async def __aenter__(self):
