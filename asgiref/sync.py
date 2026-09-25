@@ -130,12 +130,12 @@ class ThreadSensitiveContext:
     """
 
     def __init__(self, *, force_new_thread: bool = False) -> None:
-        self.force_new_thread = force_new_thread
+        self._force_new_thread = force_new_thread
         self.token: contextvars.Token[ThreadSensitiveContext] | None = None
         self._old_executor: CurrentThreadExecutor | None = None
 
     async def __aenter__(self):
-        if self.force_new_thread:
+        if self._force_new_thread:
 
             """
             (temporary, remove before merge)
@@ -375,7 +375,7 @@ class ThreadSensitiveContext:
         executor = SyncToAsync.context_to_thread_executor.pop(self, None)
         SyncToAsync.thread_sensitive_context.reset(self.token)
         self.token = None
-        if self.force_new_thread:
+        if self._force_new_thread:
             AsyncToSync.executors.current = self._old_executor
             self._old_executor = None
         if executor:
