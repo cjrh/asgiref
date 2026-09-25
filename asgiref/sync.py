@@ -131,7 +131,7 @@ class ThreadSensitiveContext:
 
     def __init__(self, *, force_new_thread: bool = False) -> None:
         self.force_new_thread = force_new_thread
-        self.token: "contextvars.Token[ThreadSensitiveContext] | None" = None
+        self.token: contextvars.Token[ThreadSensitiveContext] | None = None
         self._old_executor: CurrentThreadExecutor | None = None
 
     async def __aenter__(self):
