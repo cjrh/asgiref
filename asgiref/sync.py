@@ -136,19 +136,23 @@ class ThreadSensitiveContext:
 
     async def __aenter__(self):
         """
-        (temporary, remove before merge)
+        (temporary, remove before merge. Some part of these notes may be useful
+        in a docstring, but the primary purpose right now is just understanding
+        the problem and explaining the work to collaborators during the dev
+        process)
 
-        =============
-        EXPLANATION 1
-        =============
+        ===========
+        EXPLANATION
+        ===========
 
         Ok, story time. Why oh why are we juggling executors here inside `ThreadSensitiveContext`?
 
-        Let's establish some observations:
+        Let's slowly build up our understanding of the problem.
 
         - We want to allow `async with transaction.atomic():`
-        - We'll implement the async support with something like this (on `Atomic`). Let's start
-          WITHOUT transaction-specific isolation, so we can see what's missing.
+        - For that, we'll implement the async support with something like this below (on `Atomic`).
+          Let's start WITHOUT transaction-specific isolation, so we can see what's missing.
+
           These sketches show one entry/exit pair, not a complete implementation. Django's task
           tracking and full entry-failure/cancellation cleanup are omitted. Reusing an `Atomic`
           instance also needs per-entry state, rather than the simple instance attributes below.
@@ -166,9 +170,9 @@ class ThreadSensitiveContext:
                 await self._tsc.__aexit__(*exc)
         ```
 
-        - Note we are first entering ThreadSensitiveContext, and thereafter calling `sync_to_async`.
+        - Note we are first entering `ThreadSensitiveContext`, and thereafter calling `sync_to_async`.
           Entering the context does not itself create a thread.
-        - Which thread does `sync_to_async` use? It depends:
+        - Which thread does the above `sync_to_async` call use? It depends:
             - If `thread_sensitive==False` => the supplied executor, or the event loop's default executor
             - Otherwise, if a parent `async_to_sync` executor is visible => the waiting parent sync thread
             - Otherwise, the executor of the current `ThreadSensitiveContext`, if one is active
@@ -177,22 +181,25 @@ class ThreadSensitiveContext:
 
         - Special note about the executor of the current `ThreadSensitiveContext`: If there is no
           executor created yet, `sync_to_async` creates one. Submitting the first call starts its worker.
-          Later calls in the same context reuse that worker. In Django ASGI, request handlers are already
+          Later calls in the same context reuse that worker. In Django ASGI, all request handlers are already
           wrapped in `ThreadSensitiveContext`! A plain nested context reuses that request context.
           The context marker is already set, even if its worker has not started yet.
 
-        - The problem with our first example is that the thread being used in the `sync_to_async` call
-          IS NOT reserved for this transaction. Other tasks in the request can use it too.
-          A thread living longer than a transaction is not itself a problem. Sharing its connection
+        - The problem with our `__aenter__()` code above is that the thread being used in the `sync_to_async` call
+          IS NOT reserved exclusively for this transaction. Other (async) tasks in the request can use it too.
+          A thread living longer than a transaction is not itself a problem. Sharing its **connection**
           with other tasks WHILE THE TRANSACTION IS OPEN is the problem.
 
         - "So what?", you might say. Well, the issue lies with how Django hands out connections.
-          On a sync worker, Django keeps one connection wrapper per database alias, per thread.
+          On a sync worker, Django keeps one connection wrapper per database alias, **per thread**.
           This is thread-local storage, not necessarily a connection pool.
           Now, if we have THE SAME THREAD being used inside and outside of the `transaction.atomic`
-          scope, those calls can use the same db connection.
+          scope, those calls can use the same db connection. A db-transaction is not a thread-local concept,
+          it is a connection-local concept. Without using an exclusive connection for a
+          `transaction.atomic` scope, rollbacks can affect other unintended writes on the same connection.
 
-        - This means that multiple async tasks can submit db operations to that same thread and
+        - This means that multiple async tasks (in the same request), if they are running in the same
+          thread, can submit db operations to that same thread and therefore connection.
           connection. The sync calls run one at a time, BUT a transaction spans several calls:
           begin, database work, and commit/rollback. An `await` between these calls lets another
           task submit work on the same connection while the first task's transaction is still open.
@@ -200,8 +207,14 @@ class ThreadSensitiveContext:
         - A ROLLBACK would then undo writes made by those other tasks during that transaction,
           even though they are not part of the same `transaction.atomic` scope. This is a very bad thing.
 
+
+
+          Make sure you understand the problem above before continuing. It only gets worse from here.
+
+
+
         - Yes, this is complex. It's not just you. Here is an example of the problem from the
-          user perspective:
+          end user perspective:
 
               ======================================================================
                  Imagine two tasks started by the same async view. Both use the same
@@ -311,9 +324,235 @@ class ThreadSensitiveContext:
           the very call that is waiting for them. Clearing only the inherited executor at entry lets
           these later bridges work normally, without sending our transaction back to the parent thread.
 
-        =============
-        EXPLANATION 2
-        =============
+        Why not just "set a flag" here and let `sync_to_async` check it???
+        ==================================================================
+
+        One alternative idea might be to just set a new flag here in `ThreadSensitiveContext.__aenter__()`,
+        and have `sync_to_async` check that flag before checking the parent `CurrentThreadExecutor`. 
+        If the flag is set, it would always select the thread pool for this context.
+
+        Unfortunately, this seemingly-simpler idea doesn't work.
+
+        A flag-based design *could* work, but the flag cannot simply mean "always
+        choose the scope's thread pool while this block is active". We would have to ignore
+        the executor inherited at entry, but still allow a NEW CurrentThreadExecutor
+        created by an AsyncToSync call inside the scope.
+
+        The important detail is how CurrentThreadExecutor runs work on a worker
+        that is **already inside a synchronous call**. In that scenario, it does *not* create another
+        worker. It lets the existing worker execute additional function calls
+        INSIDE the synchronous waiting code.
+
+        Let's work through a more fleshed out code example.
+
+        1. A concrete example
+        ---------------------
+
+        ```python
+        from asgiref.sync import (
+            ThreadSensitiveContext,
+            async_to_sync,
+            sync_to_async,
+        )
+
+
+        def inner_sync():
+            return 42
+
+
+        async def middle_async():
+            return await sync_to_async(inner_sync)()
+
+
+        def outer_sync():
+            return async_to_sync(middle_async)()
+
+
+        async def request():
+            async with ThreadSensitiveContext(force_new_thread=True):
+                return await sync_to_async(outer_sync)()
+
+
+        print(async_to_sync(request)())
+        ```
+
+        There are three relevant threads:
+
+        - A: the original synchronous caller.
+        - L: the event-loop thread, running request() and later middle_async().
+        - B: the new worker selected by the forced scope.
+
+        The scope hides A's inherited executor. Its first sync_to_async(outer_sync)
+        call therefore creates and uses the scope's single-worker pool.
+
+        B is now executing outer_sync() as a job from that pool.
+
+        2. outer_sync() calls AsyncToSync
+        --------------------------------
+
+        Inside B, this line runs:
+
+        ```python
+        return async_to_sync(middle_async)()
+        ```
+
+        AsyncToSync.__call__() creates and installs an executor:
+
+        ```python
+        old_executor = getattr(self.executors, "current", None)
+        current_executor = CurrentThreadExecutor(old_executor)
+        self.executors.current = current_executor
+        ```
+
+        Call this new executor C_B.
+
+        Creating C_B does NOT create a thread. Its constructor records the existing
+        thread, which is B:
+
+        ```python
+        # CurrentThreadExecutor.__init__(), in current_thread_executor.py
+        self._work_thread = threading.current_thread()
+        ```
+
+        C_B also has its own work queue. This is SEPARATE from the thread pool's
+        queue. Both executors can run work on B, but they do so differently.
+
+        AsyncToSync copies the context containing C_B and schedules middle_async()
+        on the existing event-loop thread L.
+
+        3. B waits by running C_B's work loop
+        ------------------------------------
+
+        This is the important call in AsyncToSync.__call__():
+
+        ```python
+        current_executor.run_until_future(call_result)
+        ```
+
+        B calls this method DIRECTLY. B does not return from outer_sync() first.
+
+        Inside CurrentThreadExecutor.run_until_future(), the relevant code is:
+
+        ```python
+        while True:
+            with self._work_ready:
+                while not self._work_items and not self._broken:
+                    self._work_ready.wait()
+                if not self._work_items:
+                    break
+                work_item = self._work_items.popleft()
+            work_item.run()
+        ```
+
+        In other words: "While waiting for middle_async() to finish, run any work
+        submitted to C_B."
+
+        B may wait on the condition when that queue is empty. But when work arrives,
+        B wakes and executes it. It is not just waiting for the async result without
+        doing anything else.
+
+        4. middle_async() submits inner_sync()
+        --------------------------------------
+
+        On event-loop thread L, this line runs:
+
+        ```python
+        return await sync_to_async(inner_sync)()
+        ```
+
+        middle_async() received the context containing C_B. Therefore, the existing
+        selection order in SyncToAsync.__call__() chooses C_B:
+
+        ```python
+        # Remaining branches omitted.
+        current_thread_executor = getattr(AsyncToSync.executors, "current", None)
+        if current_thread_executor:
+            executor = current_thread_executor
+        elif self.thread_sensitive_context.get(None):
+            # Select the scope's thread pool instead.
+            ...
+        ```
+
+        Later, loop.run_in_executor(executor, ...) submits the work to the selected
+        executor. That API does not always mean "put work in a thread pool". Here,
+        the selected executor is C_B.
+
+        C_B.submit() puts the work into C_B's queue and wakes B. B's run_until_future()
+        loop takes that work and executes it. The relevant call stack on B is:
+
+        ```text
+        outer_sync()
+          -> AsyncToSync.__call__()
+            -> CurrentThreadExecutor.run_until_future()
+              -> work_item.run()
+                -> inner_sync()
+        ```
+
+        Other adapter frames are omitted here. B is NOT running two independent
+        pool jobs at once. It runs inner_sync() as a NESTED CALL inside the machinery
+        used by outer_sync() to wait.
+
+        When inner_sync() returns, middle_async() can finish. That completes the
+        future B is waiting for. B can leave run_until_future(), return from
+        AsyncToSync, and finish outer_sync().
+
+        5. What the naive flag would change
+        ----------------------------------
+
+        Suppose executor selection instead starts with:
+
+        ```python
+        if forced_scope_active:
+            executor = scope_thread_pool
+        ```
+
+        That flag is still true inside middle_async(). So inner_sync() goes into
+        the ORDINARY POOL QUEUE, not C_B's queue.
+
+        But B has not finished its existing pool job: outer_sync(). B is currently
+        servicing C_B's queue, not taking another job from the pool queue.
+
+        This creates a cycle:
+
+        ```text
+        outer_sync cannot return until middle_async finishes.
+        middle_async cannot finish until inner_sync finishes.
+        inner_sync cannot start from the pool queue until outer_sync returns.
+        ```
+
+        That is the deadlock. There is pending work in the pool queue, but B is
+        waiting for work in a DIFFERENT queue.
+
+        6. Why clearing current once avoids this
+        ---------------------------------------
+
+        At scope entry, we hide A's INHERITED executor by setting the current
+        context's binding to None. Later, AsyncToSync inside B installs C_B, which
+        the normal selection logic accepts.
+
+        Clearing the binding at entry is not a permanent ban on CurrentThreadExecutor
+        instances. The sequence is:
+
+        - Enter the forced scope: save A's executor and set current=None.
+        - Use the scope's pool to run outer_sync() on B.
+        - Inside B, AsyncToSync installs C_B for the nested async call.
+        - middle_async() uses C_B to send inner_sync() back to B.
+        - The nested bridge restores its previous binding, None.
+        - Exiting the forced scope restores A's executor in the caller's context.
+
+        The distinction is:
+
+        - Inherited executor A: must not pull work out of the new scope.
+        - New executor C_B: must remain usable for callbacks into B while B waits.
+
+        A flag-based design must preserve this distinction, including nested
+        restoration and preventing executor fallback from returning work to an
+        excluded parent scope. The save/clear/restore approach is not the only valid
+        design; it lets the existing executor-selection rules handle both cases.
+
+        =========================================================================
+        Candidate function docstring (the above explanation might be "too much"?)
+        =========================================================================
 
         (AI)
 
